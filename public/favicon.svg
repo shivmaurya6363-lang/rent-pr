@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" shape-rendering="geometricPrecision">
+  <!-- Background: forest green matching the uploaded logo -->
+  <rect width="500" height="500" fill="#2B6040"/>
+
+  <!-- "r" letter: bold, rounded — stem -->
+  <rect x="112" y="128" width="82" height="258" rx="16" ry="16" fill="white"/>
+
+  <!-- "r" letter: arm (curved top-right) -->
+  <path d="
+    M 194 128
+    L 262 128
+    Q 376 128 384 202
+    Q 390 254 350 278
+    Q 326 292 288 294
+    L 194 294
+    L 194 252
+    L 276 252
+    Q 312 252 318 226
+    Q 323 202 296 188
+    Q 276 178 248 178
+    L 194 178
+    Z
+  " fill="white"/>
+
+  <!-- Subtle silver border on the letter for embossed effect -->
+  <rect x="112" y="128" width="82" height="258" rx="16" ry="16"
+        fill="none" stroke="rgba(200,210,200,0.45)" stroke-width="4"/>
+  <path d="
+    M 194 128
+    L 262 128
+    Q 376 128 384 202
+    Q 390 254 350 278
+    Q 326 292 288 294
+    L 194 294
+    L 194 252
+    L 276 252
+    Q 312 252 318 226
+    Q 323 202 296 188
+    Q 276 178 248 178
+    L 194 178
+    Z
+  " fill="none" stroke="rgba(200,210,200,0.45)" stroke-width="4"/>
+</svg>
