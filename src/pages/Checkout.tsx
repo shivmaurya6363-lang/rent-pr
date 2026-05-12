@@ -90,7 +90,7 @@ const Checkout = () => {
         breakdown,
         {
           ...formData,
-          paymentMethod: "upi",
+          paymentMethod: "razorpay",
         },
         version,
         couponDiscount

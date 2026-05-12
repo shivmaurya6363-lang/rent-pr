@@ -28,25 +28,54 @@ function getAuthHeader(): string {
   return "Basic " + btoa(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`);
 }
 
-function requiresAuthForPath(path: string) {
-  return !["webhook", "create-order", "create-plan", "create-subscription", "razorpay-payment", "verify-payment"].includes(path);
+async function computeHmacSha256(secret: string, message: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(message));
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 async function verifySignature(payload: string, signature: string): Promise<boolean> {
-  const encoder = new TextEncoder();
-  const keyData = encoder.encode(RAZORPAY_KEY_SECRET);
-  const msgData = encoder.encode(payload);
+  const expected = await computeHmacSha256(RAZORPAY_KEY_SECRET, payload);
+  return expected === signature;
+}
 
-  const cryptoKey = await crypto.subtle.importKey(
-    "raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
-  );
+// Verify Razorpay webhook X-Razorpay-Signature header
+async function verifyWebhookSignature(rawBody: string, signature: string): Promise<boolean> {
+  const webhookSecret = Deno.env.get("RAZORPAY_WEBHOOK_SECRET") || RAZORPAY_KEY_SECRET;
+  const expected = await computeHmacSha256(webhookSecret, rawBody);
+  return expected === signature;
+}
 
-  const sig = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
-  const expectedSignature = Array.from(new Uint8Array(sig))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
+// Endpoints that do NOT require a user JWT
+const PUBLIC_PATHS = new Set(["webhook"]);
 
-  return expectedSignature === signature;
+async function authenticate(req: Request): Promise<{ userId: string } | Response> {
+  const authHeader = req.headers.get("Authorization");
+  if (!authHeader?.startsWith("Bearer ")) {
+    return jsonResponse({ error: "Unauthorized: missing bearer token" }, 401);
+  }
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+    return jsonResponse({ error: "Supabase auth secrets are not configured" }, 500);
+  }
+  const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    global: { headers: { Authorization: authHeader } },
+  });
+  const token = authHeader.replace("Bearer ", "").trim();
+  const { data: claimsData, error: claimsError } = await supabase.auth.getClaims(token);
+  const userId = claimsData?.claims?.sub;
+  if (claimsError || !userId) {
+    return jsonResponse({ error: "Unauthorized: invalid or expired token" }, 401);
+  }
+  return { userId };
 }
 
 Deno.serve(async (req) => {
@@ -55,98 +84,71 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const url = new URL(req.url);
-    const path = url.pathname.split("/").pop();
-
     if (!RAZORPAY_KEY_ID || !RAZORPAY_KEY_SECRET) {
-      return jsonResponse({
-        error: "Razorpay credentials are not configured in edge function secrets",
-      }, 500);
+      return jsonResponse({ error: "Razorpay credentials are not configured" }, 500);
     }
 
-    // Auth check for protected endpoints
+    const url = new URL(req.url);
+    const segments = url.pathname.split("/").filter(Boolean);
+    const path = segments[segments.length - 1] ?? "";
+
+    // ===== AUTH =====
     let userId: string | null = null;
-    if (path && requiresAuthForPath(path)) {
-      const requestAuthHeader = req.headers.get("Authorization");
-      if (!requestAuthHeader?.startsWith("Bearer ")) {
-        return jsonResponse({ error: "Unauthorized: missing bearer token" }, 401);
-      }
-
-      if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-        return jsonResponse({ error: "Supabase auth secrets are not configured" }, 500);
-      }
-
-      const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-        global: { headers: { Authorization: requestAuthHeader } },
-      });
-
-      const token = requestAuthHeader.replace("Bearer ", "").trim();
-      const { data: claimsData, error: claimsError } = await supabase.auth.getClaims(token);
-      const claimUserId = claimsData?.claims?.sub;
-
-      if (claimsError || !claimUserId) {
-        return jsonResponse({ error: "Unauthorized: invalid or expired token" }, 401);
-      }
-
-      userId = claimUserId;
+    if (!PUBLIC_PATHS.has(path)) {
+      const authResult = await authenticate(req);
+      if (authResult instanceof Response) return authResult;
+      userId = authResult.userId;
     }
 
-    const body = await req.json();
+    // For webhook we need the raw body for signature verification
+    let rawBody = "";
+    let body: Record<string, unknown> = {};
+
+    if (path === "webhook") {
+      rawBody = await req.text();
+      try { body = JSON.parse(rawBody); } catch { body = {}; }
+    } else {
+      body = await req.json();
+    }
 
     // ===== CREATE RAZORPAY PLAN =====
     if (path === "create-plan") {
-      const { period, interval, item } = body;
+      const { period, interval, item } = body as any;
 
       if (!period || !interval || !item?.name || !item?.amount) {
         return jsonResponse({ error: "period, interval, and item (name, amount) are required" }, 400);
       }
 
       const planPayload = {
-        period: period, // "monthly", "weekly", "yearly", "daily"
-        interval: interval, // e.g. 1 for every month
+        period,
+        interval: Number(interval),
         item: {
           name: item.name,
-          amount: Math.round(Number(item.amount) * 100), // Convert to paise
+          amount: Math.round(Number(item.amount) * 100), // rupees → paise
           currency: item.currency || "INR",
           description: item.description || "",
         },
-        notes: body.notes || {},
+        notes: (body as any).notes || {},
       };
 
       console.log("[Razorpay] Creating plan:", JSON.stringify(planPayload));
 
       const rzpRes = await fetch(`${RAZORPAY_API_BASE}/plans`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: getAuthHeader(),
-        },
+        headers: { "Content-Type": "application/json", Authorization: getAuthHeader() },
         body: JSON.stringify(planPayload),
       });
-
       const rzpData = await rzpRes.json();
-      console.log("[Razorpay] Plan response:", JSON.stringify(rzpData));
 
       if (rzpData.id) {
-        return jsonResponse({
-          success: true,
-          planId: rzpData.id,
-          period: rzpData.period,
-          interval: rzpData.interval,
-          item: rzpData.item,
-        });
+        return jsonResponse({ success: true, planId: rzpData.id, period: rzpData.period, interval: rzpData.interval, item: rzpData.item });
       }
-
-      return jsonResponse({
-        success: false,
-        error: rzpData.error?.description || "Razorpay plan creation failed",
-        details: rzpData,
-      }, 400);
+      return jsonResponse({ success: false, error: rzpData.error?.description || "Plan creation failed", details: rzpData }, 400);
     }
 
     // ===== CREATE RAZORPAY SUBSCRIPTION =====
     if (path === "create-subscription") {
-      const { plan_id, total_count, quantity, notes, customer_notify, upfront_amount } = body;
+      const { plan_id, total_count, quantity, notes, customer_notify, upfront_amount } = body as any;
 
       if (!plan_id || !total_count) {
         return jsonResponse({ error: "plan_id and total_count are required" }, 400);
@@ -160,7 +162,6 @@ Deno.serve(async (req) => {
         notes: notes || {},
       };
 
-      // Add upfront amount (security deposit + delivery + installation) as addons
       if (upfront_amount && Number(upfront_amount) > 0) {
         subscriptionPayload.addons = [
           {
@@ -177,15 +178,10 @@ Deno.serve(async (req) => {
 
       const rzpRes = await fetch(`${RAZORPAY_API_BASE}/subscriptions`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: getAuthHeader(),
-        },
+        headers: { "Content-Type": "application/json", Authorization: getAuthHeader() },
         body: JSON.stringify(subscriptionPayload),
       });
-
       const rzpData = await rzpRes.json();
-      console.log("[Razorpay] Subscription response:", JSON.stringify(rzpData));
 
       if (rzpData.id) {
         return jsonResponse({
@@ -196,17 +192,12 @@ Deno.serve(async (req) => {
           keyId: RAZORPAY_KEY_ID,
         });
       }
-
-      return jsonResponse({
-        success: false,
-        error: rzpData.error?.description || "Razorpay subscription creation failed",
-        details: rzpData,
-      }, 400);
+      return jsonResponse({ success: false, error: rzpData.error?.description || "Subscription creation failed", details: rzpData }, 400);
     }
 
-    // ===== CREATE RAZORPAY ORDER (legacy/one-time) =====
+    // ===== CREATE RAZORPAY ORDER (one-time payment) =====
     if (path === "create-order" || path === "razorpay-payment") {
-      const { amount, currency, receipt, notes } = body;
+      const { amount, currency, receipt, notes } = body as any;
 
       const numericAmount = Number(amount);
       if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
@@ -220,73 +211,39 @@ Deno.serve(async (req) => {
         notes: notes || {},
       };
 
-      console.log("[Razorpay] Creating order:", JSON.stringify(orderPayload));
-
       const rzpRes = await fetch(`${RAZORPAY_API_BASE}/orders`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: getAuthHeader(),
-        },
+        headers: { "Content-Type": "application/json", Authorization: getAuthHeader() },
         body: JSON.stringify(orderPayload),
       });
-
       const rzpData = await rzpRes.json();
-      console.log("[Razorpay] Order response:", JSON.stringify(rzpData));
 
       if (rzpData.id) {
-        return jsonResponse({
-          success: true,
-          orderId: rzpData.id,
-          amount: rzpData.amount,
-          currency: rzpData.currency,
-          keyId: RAZORPAY_KEY_ID,
-        });
+        return jsonResponse({ success: true, orderId: rzpData.id, amount: rzpData.amount, currency: rzpData.currency, keyId: RAZORPAY_KEY_ID });
       }
-
-      return jsonResponse({
-        success: false,
-        error: rzpData.error?.description || "Razorpay order creation failed",
-        details: rzpData,
-      }, 400);
+      return jsonResponse({ success: false, error: rzpData.error?.description || "Order creation failed", details: rzpData }, 400);
     }
 
     // ===== VERIFY PAYMENT SIGNATURE =====
     if (path === "verify-payment") {
-      const { razorpay_subscription_id, razorpay_payment_id, razorpay_signature,
-              razorpay_order_id } = body;
-
-      // Subscription flow: subscription_id|payment_id
-      // Order flow: order_id|payment_id
+      const { razorpay_subscription_id, razorpay_payment_id, razorpay_signature, razorpay_order_id } = body as any;
       const entityId = razorpay_subscription_id || razorpay_order_id;
 
       if (!entityId || !razorpay_payment_id || !razorpay_signature) {
         return jsonResponse({ error: "All payment fields are required" }, 400);
       }
 
-      const message = `${entityId}|${razorpay_payment_id}`;
-      const isValid = await verifySignature(message, razorpay_signature);
-
-      console.log("[Razorpay] Signature verification:", { isValid, razorpay_payment_id, entityId });
-
+      const isValid = await verifySignature(`${entityId}|${razorpay_payment_id}`, razorpay_signature);
       if (!isValid) {
         return jsonResponse({ success: false, error: "Payment signature verification failed" }, 400);
       }
 
-      return jsonResponse({
-        success: true,
-        verified: true,
-        paymentId: razorpay_payment_id,
-        subscriptionId: razorpay_subscription_id || null,
-        orderId: razorpay_order_id || null,
-      });
+      return jsonResponse({ success: true, verified: true, paymentId: razorpay_payment_id });
     }
 
-    // ===== CONFIRM ORDER (after payment verified — supports both subscription & order flows) =====
+    // ===== CONFIRM ORDER (subscription or one-time) =====
     if (path === "confirm-order") {
-      const { razorpay_subscription_id, razorpay_payment_id, razorpay_signature,
-              razorpay_order_id, orderData } = body;
-
+      const { razorpay_subscription_id, razorpay_payment_id, razorpay_signature, razorpay_order_id, orderData } = body as any;
       const entityId = razorpay_subscription_id || razorpay_order_id;
 
       if (!entityId || !razorpay_payment_id || !razorpay_signature || !orderData) {
@@ -294,39 +251,54 @@ Deno.serve(async (req) => {
       }
 
       // Step 1: Verify signature
-      const message = `${entityId}|${razorpay_payment_id}`;
-      const isValid = await verifySignature(message, razorpay_signature);
-
+      const isValid = await verifySignature(`${entityId}|${razorpay_payment_id}`, razorpay_signature);
       if (!isValid) {
         return jsonResponse({ success: false, error: "Payment verification failed. Signature mismatch." }, 400);
       }
 
-      // Step 2: Double-check payment status with Razorpay API
+      // Step 2: Confirm payment status with Razorpay API
       const paymentRes = await fetch(`${RAZORPAY_API_BASE}/payments/${razorpay_payment_id}`, {
         headers: { Authorization: getAuthHeader() },
       });
       const paymentData = await paymentRes.json();
 
       if (paymentData.status !== "captured" && paymentData.status !== "authorized") {
-        return jsonResponse({
-          success: false,
-          error: `Payment not completed. Status: ${paymentData.status}`,
-        }, 400);
+        return jsonResponse({ success: false, error: `Payment not completed. Status: ${paymentData.status}` }, 400);
       }
 
-      // Step 3: Create order using service role
       const adminClient = createClient(
         Deno.env.get("SUPABASE_URL")!,
         Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
       );
 
+      // Validate customer_id matches the authenticated user
       if (userId && orderData.customer_id && orderData.customer_id !== userId) {
-        return jsonResponse({ success: false, error: "Unauthorized customer_id mismatch" }, 403);
+        return jsonResponse({ success: false, error: "Unauthorized: customer_id mismatch" }, 403);
       }
 
+      // Step 3: Idempotency — check if this payment was already processed
+      const { data: existingPayment } = await adminClient
+        .from("payments")
+        .select("id, order_id")
+        .eq("transaction_id", razorpay_payment_id)
+        .maybeSingle();
+
+      if (existingPayment?.order_id) {
+        const { data: existingOrder } = await adminClient
+          .from("orders")
+          .select("id, order_number")
+          .eq("id", existingPayment.order_id)
+          .maybeSingle();
+        if (existingOrder) {
+          return jsonResponse({ success: true, orderId: existingOrder.id, orderNumber: existingOrder.order_number });
+        }
+      }
+
+      // Step 4: Create order — mark as confirmed since payment is verified
       const safeOrderData = {
         ...orderData,
         customer_id: userId ?? orderData.customer_id,
+        status: "confirmed",
       };
 
       const { data: order, error: orderError } = await adminClient
@@ -340,14 +312,14 @@ Deno.serve(async (req) => {
         return jsonResponse({ success: false, error: orderError.message }, 500);
       }
 
-      // Step 4: Create payment record
+      // Step 5: Create payment record
       await adminClient.from("payments").insert({
         order_id: order.id,
         amount: safeOrderData.payable_now_total,
         payment_method: "razorpay",
-        status: "completed",
         payment_gateway: "razorpay",
         transaction_id: razorpay_payment_id,
+        status: "completed",          // column is 'status', typed payment_status enum
         payment_date: new Date().toISOString(),
         metadata: {
           razorpay_subscription_id: razorpay_subscription_id || null,
@@ -357,17 +329,23 @@ Deno.serve(async (req) => {
         },
       });
 
-      return jsonResponse({
-        success: true,
-        orderId: order.id,
-        orderNumber: order.order_number,
-      });
+      return jsonResponse({ success: true, orderId: order.id, orderNumber: order.order_number });
     }
 
     // ===== WEBHOOK =====
     if (path === "webhook") {
-      const event = body.event;
-      const payload = body.payload;
+      // Verify webhook signature before processing
+      const webhookSig = req.headers.get("X-Razorpay-Signature") || "";
+      if (webhookSig) {
+        const isValid = await verifyWebhookSignature(rawBody, webhookSig);
+        if (!isValid) {
+          console.error("[Razorpay Webhook] Signature verification failed");
+          return jsonResponse({ error: "Webhook signature verification failed" }, 400);
+        }
+      }
+
+      const event = (body as any).event;
+      const payload = (body as any).payload;
 
       console.log("[Razorpay Webhook]", { event });
 
@@ -376,15 +354,14 @@ Deno.serve(async (req) => {
         Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
       );
 
-      // Payment captured
+      // Payment captured (one-time order)
       if (event === "payment.captured" && payload?.payment?.entity) {
         const payment = payload.payment.entity;
-        const rzpPaymentId = payment.id;
 
         const { data: existingPayment } = await adminClient
           .from("payments")
           .select("id, order_id")
-          .eq("transaction_id", rzpPaymentId)
+          .eq("transaction_id", payment.id)
           .maybeSingle();
 
         if (existingPayment) {
@@ -395,7 +372,7 @@ Deno.serve(async (req) => {
 
           await adminClient
             .from("orders")
-            .update({ status: "confirmed", confirmed_at: new Date().toISOString() })
+            .update({ status: "confirmed" })
             .eq("id", existingPayment.order_id);
         }
       }
@@ -403,12 +380,11 @@ Deno.serve(async (req) => {
       // Payment failed
       if (event === "payment.failed" && payload?.payment?.entity) {
         const payment = payload.payment.entity;
-        const rzpPaymentId = payment.id;
 
         const { data: existingPayment } = await adminClient
           .from("payments")
           .select("id")
-          .eq("transaction_id", rzpPaymentId)
+          .eq("transaction_id", payment.id)
           .maybeSingle();
 
         if (existingPayment) {
@@ -419,59 +395,102 @@ Deno.serve(async (req) => {
         }
       }
 
-      // Subscription authenticated (first payment authorized)
-      if (event === "subscription.authenticated" && payload?.subscription?.entity) {
-        console.log("[Razorpay Webhook] Subscription authenticated:", payload.subscription.entity.id);
-      }
-
-      // Subscription activated
+      // Subscription activated (mandate registered, ready to charge)
       if (event === "subscription.activated" && payload?.subscription?.entity) {
-        console.log("[Razorpay Webhook] Subscription activated:", payload.subscription.entity.id);
+        const sub = payload.subscription.entity;
+        console.log("[Razorpay Webhook] Subscription activated:", sub.id);
+
+        // Ensure the order is confirmed once mandate is active
+        const { data: existingPayment } = await adminClient
+          .from("payments")
+          .select("order_id")
+          .eq("metadata->>razorpay_subscription_id", sub.id)
+          .maybeSingle();
+
+        if (existingPayment?.order_id) {
+          await adminClient
+            .from("orders")
+            .update({ status: "confirmed" })
+            .eq("id", existingPayment.order_id);
+        }
       }
 
-      // Subscription charged (recurring payment success)
+      // Subscription charged (recurring monthly debit succeeded)
       if (event === "subscription.charged" && payload?.subscription?.entity) {
         const sub = payload.subscription.entity;
         const paymentEntity = payload.payment?.entity;
         console.log("[Razorpay Webhook] Subscription charged:", sub.id, paymentEntity?.id);
 
-        // Find order by subscription ID in payment metadata
         if (paymentEntity?.id) {
-          const { data: existingPayment } = await adminClient
+          // Find the original order via the subscription_id stored in payment metadata
+          const { data: originalPayment } = await adminClient
             .from("payments")
-            .select("id, order_id, metadata")
+            .select("id, order_id")
             .eq("metadata->>razorpay_subscription_id", sub.id)
-            .limit(1)
             .maybeSingle();
 
-          if (existingPayment) {
-            // Record the recurring payment in monthly_payments
-            await adminClient.from("monthly_payments").insert({
-              order_id: existingPayment.order_id,
-              billing_month: new Date().toISOString().slice(0, 10),
-              monthly_rent: (paymentEntity.amount || 0) / 100,
-              gst: 0,
-              total_amount: (paymentEntity.amount || 0) / 100,
-              status: "completed",
-              paid_at: new Date().toISOString(),
-              transaction_id: paymentEntity.id,
-            });
+          if (originalPayment?.order_id) {
+            // Get order details for monthly amount
+            const { data: order } = await adminClient
+              .from("orders")
+              .select("monthly_rent, monthly_gst, protection_plan_fee, monthly_total")
+              .eq("id", originalPayment.order_id)
+              .maybeSingle();
+
+            // Record recurring monthly payment in the payments table
+            const { data: existingRecurring } = await adminClient
+              .from("payments")
+              .select("id")
+              .eq("transaction_id", paymentEntity.id)
+              .maybeSingle();
+
+            if (!existingRecurring) {
+              const totalAmount = (paymentEntity.amount || 0) / 100;
+              const monthlyRent = order?.monthly_rent ?? 0;
+              const monthlyGst = order?.monthly_gst ?? 0;
+              const protectionFee = order?.protection_plan_fee ?? 0;
+
+              // Record in monthly_payments (subscription-based recurring charges)
+              await adminClient.from("monthly_payments").insert({
+                order_id: originalPayment.order_id,
+                billing_month: new Date().toISOString().slice(0, 10), // DATE format YYYY-MM-DD
+                monthly_rent: monthlyRent,
+                gst: monthlyGst,
+                protection_plan_fee: protectionFee,
+                total_amount: totalAmount,
+                status: "completed",
+                paid_at: new Date().toISOString(),
+                transaction_id: paymentEntity.id,
+              });
+            }
           }
         }
       }
 
       // Subscription cancelled
       if (event === "subscription.cancelled" && payload?.subscription?.entity) {
-        console.log("[Razorpay Webhook] Subscription cancelled:", payload.subscription.entity.id);
+        const sub = payload.subscription.entity;
+        console.log("[Razorpay Webhook] Subscription cancelled:", sub.id);
+
+        const { data: originalPayment } = await adminClient
+          .from("payments")
+          .select("order_id")
+          .eq("metadata->>razorpay_subscription_id", sub.id)
+          .maybeSingle();
+
+        if (originalPayment?.order_id) {
+          await adminClient
+            .from("orders")
+            .update({ status: "cancelled" })
+            .eq("id", originalPayment.order_id);
+        }
       }
 
-      return new Response(JSON.stringify({ success: true }), {
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return jsonResponse({ success: true });
     }
 
     return jsonResponse({ error: "Unknown endpoint" }, 404);
-  } catch (error) {
+  } catch (error: any) {
     console.error("[Razorpay Error]", error);
     return jsonResponse({ error: error.message || "Internal server error" }, 500);
   }

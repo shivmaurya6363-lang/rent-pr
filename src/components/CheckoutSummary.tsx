@@ -6,6 +6,7 @@ import CouponInput, { type CouponDiscount } from "@/components/CouponInput";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -288,6 +289,9 @@ const CheckoutSummary = ({ onCouponChange }: CheckoutSummaryProps) => {
               <AlertTriangle className="w-5 h-5" />
               Remove Protection Plan?
             </DialogTitle>
+            <DialogDescription>
+              You are about to remove the damage protection plan from this item.
+            </DialogDescription>
           </DialogHeader>
           <div className="py-3">
             <p className="text-sm text-muted-foreground leading-relaxed">

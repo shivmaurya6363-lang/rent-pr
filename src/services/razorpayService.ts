@@ -197,7 +197,9 @@ function loadRazorpayScript(): Promise<void> {
 }
 
 /**
- * Open Razorpay Checkout for Subscription payment
+ * Open Razorpay Checkout for Subscription payment.
+ * Supports all mandate methods: UPI Autopay, Cards, Netbanking.
+ * On desktop, UPI section also shows a scannable QR code.
  */
 export async function openRazorpaySubscriptionCheckout(options: {
   subscriptionId: string;
@@ -215,13 +217,35 @@ export async function openRazorpaySubscriptionCheckout(options: {
       subscription_id: options.subscriptionId,
       name: "RentPR",
       description: options.description || "Rental Subscription",
+      image: "/rentpr-logo.png",
       prefill: {
         name: options.customerName,
         email: options.customerEmail,
         contact: options.customerPhone,
       },
-      theme: {
-        color: "#6366f1",
+      theme: { color: "#6366f1" },
+      // Show all supported mandate payment methods
+      config: {
+        display: {
+          preferences: { show_default_blocks: true },
+          blocks: {
+            upi: {
+              name: "Pay via UPI / QR",
+              instruments: [
+                { method: "upi", flows: ["qr", "collect", "intent"] },
+              ],
+            },
+            card: {
+              name: "Pay via Card (Debit / Credit)",
+              instruments: [{ method: "card" }],
+            },
+            netbanking: {
+              name: "Pay via Netbanking",
+              instruments: [{ method: "netbanking" }],
+            },
+          },
+          sequence: ["block.upi", "block.card", "block.netbanking"],
+        },
       },
       handler: function (response: any) {
         console.log("[Razorpay] Subscription payment success:", response);
@@ -248,7 +272,8 @@ export async function openRazorpaySubscriptionCheckout(options: {
 }
 
 /**
- * Open Razorpay Checkout for one-time Order payment (legacy)
+ * Open Razorpay Checkout for a one-time order payment.
+ * Shows all payment methods: UPI (with QR), Cards, Netbanking, Wallets.
  */
 export async function openRazorpayCheckout(options: {
   orderId: string;
@@ -269,14 +294,19 @@ export async function openRazorpayCheckout(options: {
       currency: options.currency,
       name: "RentPR",
       description: options.description || "Rental Payment",
+      image: "/rentpr-logo.png",
       order_id: options.orderId,
       prefill: {
         name: options.customerName,
         email: options.customerEmail,
         contact: options.customerPhone,
       },
-      theme: {
-        color: "#6366f1",
+      theme: { color: "#6366f1" },
+      // All payment methods enabled; Razorpay shows QR inside the UPI section
+      config: {
+        display: {
+          preferences: { show_default_blocks: true },
+        },
       },
       handler: function (response: any) {
         console.log("[Razorpay] Payment success:", response);

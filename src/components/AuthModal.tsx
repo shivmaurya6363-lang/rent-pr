@@ -78,10 +78,23 @@ const AuthModal = ({ open, onClose, onSuccess, title, description }: AuthModalPr
 
   const getFriendlyError = (message: string): string => {
     const lower = message.toLowerCase();
-    if (lower.includes("rate limit") || lower.includes("too many requests")) return "Too many attempts. Please wait a few minutes.";
-    if (lower.includes("invalid login credentials")) return "Invalid email or password. Please try again.";
-    if (lower.includes("user already registered")) return "An account with this email already exists. Please sign in.";
+    if (lower.includes("rate limit") || lower.includes("too many requests") || lower.includes("email rate limit exceeded")) {
+      return "Too many sign-up attempts. Please wait a few minutes and try again.";
+    }
+    if (lower.includes("invalid login credentials") || lower.includes("invalid email or password")) {
+      return "Invalid email or password. Please try again.";
+    }
+    if (lower.includes("user already registered") || lower.includes("already been registered")) {
+      return "An account with this email already exists. Please sign in instead.";
+    }
     if (lower.includes("signup is disabled")) return "New registrations are currently disabled.";
+    if (lower.includes("unable to validate email address") || lower.includes("smtp") || lower.includes("email")) {
+      return "Could not send confirmation email. Please try again in a few minutes, or contact support.";
+    }
+    // Supabase returns 500 when the free-tier email rate limit is hit
+    if (lower.includes("500") || lower.includes("internal server error") || lower.includes("unexpected_failure")) {
+      return "Sign-up is temporarily unavailable (email service limit reached). Please try again in a few minutes.";
+    }
     return message;
   };
 

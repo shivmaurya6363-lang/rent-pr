@@ -18,6 +18,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -262,7 +263,10 @@ const Header = () => {
       {/* Search Dialog */}
       <Dialog open={searchOpen} onOpenChange={setSearchOpen}>
         <DialogContent className="sm:max-w-lg">
-          <DialogHeader><DialogTitle className="text-lg">Search Products</DialogTitle></DialogHeader>
+          <DialogHeader>
+            <DialogTitle className="text-lg">Search Products</DialogTitle>
+            <DialogDescription>Search for products by name or category</DialogDescription>
+          </DialogHeader>
           <form onSubmit={handleSearch} className="space-y-4">
             <div className="relative">
               <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
