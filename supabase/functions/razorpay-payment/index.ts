@@ -294,10 +294,134 @@ Deno.serve(async (req) => {
         }
       }
 
-      // Step 4: Create order — mark as confirmed since payment is verified
+      // Step 4: Resolve product / vendor / rental-plan IDs when the product
+      //   wasn't already in the DB (comes from static frontend data).
+      //   We use service-role here so we can insert regardless of RLS.
+      const { _productSetup, ...restOrderData } = orderData as any;
+
+      let resolvedVendorId   = restOrderData.vendor_id;
+      let resolvedProductId  = restOrderData.product_id;
+      let resolvedPlanId     = restOrderData.rental_plan_id;
+
+      if (_productSetup) {
+        // --- Find or create vendor ---
+        // Prefer any existing approved vendor; never use the customer as vendor
+        let { data: vendor } = await adminClient
+          .from("vendors")
+          .select("id")
+          .eq("status", "approved")
+          .limit(1)
+          .maybeSingle();
+
+        if (!vendor) {
+          // No approved vendor yet — create a "Platform Vendor" placeholder
+          // Use a fixed well-known email so it's idempotent across checkouts
+          const { data: existingPlatform } = await adminClient
+            .from("vendors")
+            .select("id")
+            .eq("business_email", "platform@rentpr.in")
+            .maybeSingle();
+
+          if (existingPlatform) {
+            vendor = existingPlatform;
+          } else {
+            // Need a real auth user for user_id — use the customer's id as owner
+            // but mark clearly as a platform/system vendor
+            const { data: newVendor, error: vendorErr } = await adminClient
+              .from("vendors")
+              .insert({
+                user_id: userId ?? restOrderData.customer_id,
+                business_name: "RentPR Platform",
+                business_email: "platform@rentpr.in",
+                status: "approved",
+                commission_rate: 0,
+              })
+              .select("id")
+              .single();
+            if (vendorErr) {
+              console.error("[Razorpay] Vendor creation error:", vendorErr);
+              return jsonResponse({ success: false, error: "Could not resolve vendor: " + vendorErr.message }, 500);
+            }
+            vendor = newVendor;
+          }
+        }
+        resolvedVendorId = vendor.id;
+
+        // --- Find or create product ---
+        let { data: product } = await adminClient
+          .from("products")
+          .select("id")
+          .eq("slug", _productSetup.slug)
+          .maybeSingle();
+
+        if (!product) {
+          const { data: newProduct, error: productErr } = await adminClient
+            .from("products")
+            .insert({
+              vendor_id: resolvedVendorId,
+              name: _productSetup.name,
+              slug: _productSetup.slug,
+              brand: _productSetup.brand,
+              description: _productSetup.description,
+              features: _productSetup.features,
+              images: _productSetup.images,
+              specifications: _productSetup.specifications,
+              tags: _productSetup.tags,
+              rating: _productSetup.rating,
+              review_count: _productSetup.review_count,
+              in_stock: _productSetup.in_stock,
+              stock_quantity: 10,
+              status: "approved",
+            })
+            .select("id")
+            .single();
+          if (productErr) {
+            console.error("[Razorpay] Product creation error:", productErr);
+            return jsonResponse({ success: false, error: "Could not resolve product: " + productErr.message }, 500);
+          }
+          product = newProduct;
+        }
+        resolvedProductId = product.id;
+
+        // --- Find or create rental plan ---
+        let { data: plan } = await adminClient
+          .from("rental_plans")
+          .select("id")
+          .eq("product_id", resolvedProductId)
+          .eq("duration_months", _productSetup.plan.duration_months)
+          .maybeSingle();
+
+        if (!plan) {
+          const { data: newPlan, error: planErr } = await adminClient
+            .from("rental_plans")
+            .insert({
+              product_id: resolvedProductId,
+              duration_months: _productSetup.plan.duration_months,
+              monthly_rent: _productSetup.plan.monthly_rent,
+              security_deposit: _productSetup.plan.security_deposit,
+              label: _productSetup.plan.label,
+              delivery_fee: _productSetup.plan.delivery_fee,
+              installation_fee: _productSetup.plan.installation_fee,
+              is_active: true,
+            })
+            .select("id")
+            .single();
+          if (planErr) {
+            console.error("[Razorpay] Plan creation error:", planErr);
+            return jsonResponse({ success: false, error: "Could not resolve rental plan: " + planErr.message }, 500);
+          }
+          plan = newPlan;
+        }
+        resolvedPlanId = plan.id;
+      }
+
+      // Build clean order row (strip _productSetup, fill resolved IDs)
       const safeOrderData = {
-        ...orderData,
-        customer_id: userId ?? orderData.customer_id,
+        ...restOrderData,
+        customer_id: userId ?? restOrderData.customer_id,
+        vendor_id: resolvedVendorId,
+        product_id: resolvedProductId,
+        rental_plan_id: resolvedPlanId,
         status: "confirmed",
       };
 
